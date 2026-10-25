@@ -3,9 +3,13 @@
 // The MK8 client (Pia NatDetectionJob) resolves nncs1-lp1.n.n.srv.nintendo.net and
 // nncs2-lp1.n.n.srv.nintendo.net (redirected to this VPS by the console's custom DNS) and sends
 // 16-byte UDP probes to ports 10025 and 10125. Each probe is 4x u32 BIG-ENDIAN:
-//   [0]=type/test_id  [4]=ext_port(ignored)  [8]=ext_ip(ignored)  [12]=local_ip
+//
+//	[0]=type/test_id  [4]=ext_port(ignored)  [8]=ext_ip(ignored)  [12]=local_ip
+//
 // We must reply with 16 bytes, 4x u32 BIG-ENDIAN:
-//   [0]=echo type unchanged  [4]=observed UDP source port  [8]=observed source IP  [12]=server IP
+//
+//	[0]=echo type unchanged  [4]=observed UDP source port  [8]=observed source IP  [12]=server IP
+//
 // The Switch only ever sends test ids 101/102/103; the classifier compares the external port it
 // learns across tests. Ports 33334/33335 are reachability sinkholes (bind, never reply).
 //
@@ -44,6 +48,7 @@ var (
 	// shows different source ports across our two probe ports (10025 vs 10125) it is
 	// symmetric — the case the direct natbridge cannot hole-punch, i.e. the relay trigger.
 	natSeen  = map[string]map[int]int{}
+	natKinds = map[string]string{}
 	typeFile = func() string {
 		if v := os.Getenv("NNCS_TYPE_FILE"); v != "" {
 			return v
@@ -51,6 +56,33 @@ var (
 		return "/data/nat_types.txt"
 	}()
 )
+
+// loadNATState retains existing bridge entries when the responder restarts.
+// Do not erase other active clients on the first new probe after an update.
+func loadNATState() {
+	natMu.Lock()
+	defer natMu.Unlock()
+	if raw, err := os.ReadFile(natFile); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 || net.ParseIP(fields[0]).To4() == nil {
+				continue
+			}
+			port, err := strconv.Atoi(fields[1])
+			if err == nil && port > 0 && port <= 65535 {
+				natMap[fields[0]] = strconv.Itoa(port)
+			}
+		}
+	}
+	if raw, err := os.ReadFile(typeFile); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 && net.ParseIP(fields[0]).To4() != nil && (fields[1] == "cone" || fields[1] == "sym") {
+				natKinds[fields[0]] = fields[1]
+			}
+		}
+	}
+}
 
 func recordNAT(ip string, port int) {
 	natMu.Lock()
@@ -92,6 +124,11 @@ func classifyNAT(ip string, dstPort, srcPort int) {
 		if sym {
 			kind = "sym"
 		}
+		if _, known := natKinds[cip]; !known || len(ports) >= 2 {
+			natKinds[cip] = kind
+		}
+	}
+	for cip, kind := range natKinds {
 		b.WriteString(cip + " " + kind + "\n")
 	}
 	_ = os.WriteFile(typeFile, []byte(b.String()), 0644)
@@ -104,12 +141,27 @@ func ipToU32(ip net.IP) uint32 {
 	return 0
 }
 
-// serveNCS answers NAT-check probes on the given UDP port.
-func serveNCS(port int, serverIP uint32) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
-	if err != nil {
-		log.Fatalf("[nncs] bind :%d failed: %v", port, err)
+// replyNCS preserves the observed endpoint. Test 102 checks filtering and MUST
+// come from the other server port; replying on the receiving socket hides
+// address-and-port-dependent filtering from the console's native classifier.
+func replyNCS(conn, alternate *net.UDPConn, payload []byte, src *net.UDPAddr, serverIP uint32) error {
+	word0 := binary.BigEndian.Uint32(payload[0:4])
+	resp := make([]byte, 16)
+	binary.BigEndian.PutUint32(resp[0:4], word0)
+	binary.BigEndian.PutUint32(resp[4:8], uint32(src.Port))
+	binary.BigEndian.PutUint32(resp[8:12], ipToU32(src.IP))
+	binary.BigEndian.PutUint32(resp[12:16], serverIP)
+	replySocket := conn
+	if word0 == 102 {
+		replySocket = alternate
 	}
+	_, err := replySocket.WriteToUDP(resp, src)
+	return err
+}
+
+// serveNCS answers NAT-check probes using sockets bound once at startup. Sharing
+// the alternate socket avoids an ephemeral source port and concurrent bind races.
+func serveNCS(conn, alternate *net.UDPConn, port int, serverIP uint32) {
 	log.Printf("[nncs] NAT-check responder listening on UDP :%d (serverIP=%d)", port, serverIP)
 	buf := make([]byte, 128)
 	for {
@@ -122,18 +174,12 @@ func serveNCS(port int, serverIP uint32) {
 			continue
 		}
 		word0 := binary.BigEndian.Uint32(buf[0:4]) // type/test_id -> echoed unchanged
-		srcIP := ipToU32(src.IP)
-		resp := make([]byte, 16)
-		binary.BigEndian.PutUint32(resp[0:4], word0)
-		binary.BigEndian.PutUint32(resp[4:8], uint32(src.Port)) // observed external port
-		binary.BigEndian.PutUint32(resp[8:12], srcIP)           // observed external IP
-		binary.BigEndian.PutUint32(resp[12:16], serverIP)       // server IP
-		if _, err := conn.WriteToUDP(resp, src); err != nil {
+		if err := replyNCS(conn, alternate, buf[:n], src, serverIP); err != nil {
 			log.Printf("[nncs] :%d reply to %s failed: %v", port, src, err)
 			continue
 		}
 		log.Printf("[nncs] :%d test=%d <- %s:%d  replied ext=%s:%d", port, word0, src.IP, src.Port, src.IP, src.Port)
-		recordNAT(src.IP.String(), src.Port)        // bridge the external UDP endpoint to the NEX server
+		recordNAT(src.IP.String(), src.Port)         // bridge the external UDP endpoint to the NEX server
 		classifyNAT(src.IP.String(), port, src.Port) // cone vs symmetric (relay trigger)
 	}
 }
@@ -159,10 +205,27 @@ func main() {
 	if serverIPStr == "" {
 		serverIPStr = "127.0.0.1"
 	}
-	serverIP := ipToU32(net.ParseIP(serverIPStr))
+	listenIP := net.ParseIP(serverIPStr).To4()
+	if listenIP == nil {
+		log.Fatal("[nncs] NNCS_SERVER_IP must be a locally assigned IPv4 address")
+	}
+	serverIP := ipToU32(listenIP)
+	loadNATState()
 
-	go serveNCS(10025, serverIP)
-	go serveNCS(10125, serverIP)
+	// A multihomed host must not select another source IP for the reply. Both
+	// sockets use the configured node address, including alternate-port probes.
+	primary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: listenIP, Port: 10025})
+	if err != nil {
+		log.Fatalf("[nncs] bind :10025 failed: %v", err)
+	}
+	defer primary.Close()
+	secondary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: listenIP, Port: 10125})
+	if err != nil {
+		log.Fatalf("[nncs] bind :10125 failed: %v", err)
+	}
+	defer secondary.Close()
+	go serveNCS(primary, secondary, 10025, serverIP)
+	go serveNCS(secondary, primary, 10125, serverIP)
 	go sinkhole(33334)
 	go sinkhole(33335)
 	log.Printf("[nncs] mk8-nncs-local started (serverIP=%s)", serverIPStr)
