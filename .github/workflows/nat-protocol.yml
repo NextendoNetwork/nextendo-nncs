@@ -14,4 +14,15 @@ jobs:
       - run: go test -race ./... -count=1
       - run: go vet ./...
       - name: Build responder
-        run: CGO_ENABLED=0 go build -trimpath -buildvcs=true -o "$RUNNER_TEMP/nncs" .
+        run: |
+          out="$RUNNER_TEMP/nncs-candidate"
+          mkdir -p "$out"
+          CGO_ENABLED=0 go build -trimpath -buildvcs=true -o "$out/nncs" .
+          go version -m "$out/nncs" > "$out/BUILDINFO.txt"
+          git rev-parse HEAD > "$out/SOURCE_REVISION.txt"
+          cp LICENSE.md "$out/"
+          (cd "$out" && sha256sum nncs > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nncs-linux-amd64-${{ github.sha }}
+          path: ${{ runner.temp }}/nncs-candidate/
