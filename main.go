@@ -104,12 +104,27 @@ func ipToU32(ip net.IP) uint32 {
 	return 0
 }
 
-// serveNCS answers NAT-check probes on the given UDP port.
-func serveNCS(port int, serverIP uint32) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: port})
-	if err != nil {
-		log.Fatalf("[nncs] bind :%d failed: %v", port, err)
+// replyNCS preserves the observed endpoint. Test 102 checks filtering and MUST
+// come from the other server port; replying on the receiving socket hides
+// address-and-port-dependent filtering from the console's native classifier.
+func replyNCS(conn, alternate *net.UDPConn, payload []byte, src *net.UDPAddr, serverIP uint32) error {
+	word0 := binary.BigEndian.Uint32(payload[0:4])
+	resp := make([]byte, 16)
+	binary.BigEndian.PutUint32(resp[0:4], word0)
+	binary.BigEndian.PutUint32(resp[4:8], uint32(src.Port))
+	binary.BigEndian.PutUint32(resp[8:12], ipToU32(src.IP))
+	binary.BigEndian.PutUint32(resp[12:16], serverIP)
+	replySocket := conn
+	if word0 == 102 {
+		replySocket = alternate
 	}
+	_, err := replySocket.WriteToUDP(resp, src)
+	return err
+}
+
+// serveNCS answers NAT-check probes using sockets bound once at startup. Sharing
+// the alternate socket avoids an ephemeral source port and concurrent bind races.
+func serveNCS(conn, alternate *net.UDPConn, port int, serverIP uint32) {
 	log.Printf("[nncs] NAT-check responder listening on UDP :%d (serverIP=%d)", port, serverIP)
 	buf := make([]byte, 128)
 	for {
@@ -122,18 +137,12 @@ func serveNCS(port int, serverIP uint32) {
 			continue
 		}
 		word0 := binary.BigEndian.Uint32(buf[0:4]) // type/test_id -> echoed unchanged
-		srcIP := ipToU32(src.IP)
-		resp := make([]byte, 16)
-		binary.BigEndian.PutUint32(resp[0:4], word0)
-		binary.BigEndian.PutUint32(resp[4:8], uint32(src.Port)) // observed external port
-		binary.BigEndian.PutUint32(resp[8:12], srcIP)           // observed external IP
-		binary.BigEndian.PutUint32(resp[12:16], serverIP)       // server IP
-		if _, err := conn.WriteToUDP(resp, src); err != nil {
+		if err := replyNCS(conn, alternate, buf[:n], src, serverIP); err != nil {
 			log.Printf("[nncs] :%d reply to %s failed: %v", port, src, err)
 			continue
 		}
 		log.Printf("[nncs] :%d test=%d <- %s:%d  replied ext=%s:%d", port, word0, src.IP, src.Port, src.IP, src.Port)
-		recordNAT(src.IP.String(), src.Port)        // bridge the external UDP endpoint to the NEX server
+		recordNAT(src.IP.String(), src.Port)         // bridge the external UDP endpoint to the NEX server
 		classifyNAT(src.IP.String(), port, src.Port) // cone vs symmetric (relay trigger)
 	}
 }
@@ -161,8 +170,18 @@ func main() {
 	}
 	serverIP := ipToU32(net.ParseIP(serverIPStr))
 
-	go serveNCS(10025, serverIP)
-	go serveNCS(10125, serverIP)
+	primary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 10025})
+	if err != nil {
+		log.Fatalf("[nncs] bind :10025 failed: %v", err)
+	}
+	defer primary.Close()
+	secondary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 10125})
+	if err != nil {
+		log.Fatalf("[nncs] bind :10125 failed: %v", err)
+	}
+	defer secondary.Close()
+	go serveNCS(primary, secondary, 10025, serverIP)
+	go serveNCS(secondary, primary, 10125, serverIP)
 	go sinkhole(33334)
 	go sinkhole(33335)
 	log.Printf("[nncs] mk8-nncs-local started (serverIP=%s)", serverIPStr)
