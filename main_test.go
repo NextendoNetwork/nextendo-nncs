@@ -3,9 +3,42 @@ package main
 import (
 	"encoding/binary"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestRestartPreservesUnseenBridgeEntries(t *testing.T) {
+	oldFile, oldTypeFile, oldMap, oldSeen, oldKinds := natFile, typeFile, natMap, natSeen, natKinds
+	t.Cleanup(func() { natFile, typeFile, natMap, natSeen, natKinds = oldFile, oldTypeFile, oldMap, oldSeen, oldKinds })
+	dir := t.TempDir()
+	natFile, typeFile = filepath.Join(dir, "endpoints"), filepath.Join(dir, "types")
+	natMap, natSeen, natKinds = map[string]string{}, map[string]map[int]int{}, map[string]string{}
+	if err := os.WriteFile(natFile, []byte("198.51.100.1 45000\n198.51.100.2 46000\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(typeFile, []byte("198.51.100.1 sym\n198.51.100.2 cone\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	loadNATState()
+	recordNAT("198.51.100.1", 45001)
+	classifyNAT("198.51.100.1", 10025, 45001)
+	endpoints, _ := os.ReadFile(natFile)
+	kinds, _ := os.ReadFile(typeFile)
+	if !strings.Contains(string(endpoints), "198.51.100.2 46000\n") || !strings.Contains(string(endpoints), "198.51.100.1 45001\n") {
+		t.Fatal("restart discarded an unseen client endpoint")
+	}
+	if !strings.Contains(string(kinds), "198.51.100.2 cone\n") || !strings.Contains(string(kinds), "198.51.100.1 sym\n") {
+		t.Fatal("restart discarded classifications before fresh observations")
+	}
+	classifyNAT("198.51.100.1", 10125, 45001)
+	kinds, _ = os.ReadFile(typeFile)
+	if !strings.Contains(string(kinds), "198.51.100.1 cone\n") {
+		t.Fatal("fresh mapping observations did not update prior state")
+	}
+}
 
 func localSocket(t *testing.T) *net.UDPConn {
 	t.Helper()

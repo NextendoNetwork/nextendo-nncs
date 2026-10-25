@@ -16,6 +16,11 @@ Both sockets bind the locally assigned IPv4 configured in `NNCS_SERVER_IP`.
 This prevents a multihomed host from choosing another source address when it
 sends the alternate-port reply. Configure each node's own address before startup.
 
+Existing endpoint/classification bridge files are loaded before serving probes.
+Entries for clients not yet seen by the new process remain in subsequent writes;
+an existing mapping classification is retained until both mapping ports have fresh
+observations. This avoids dropping the bridge cache during a service update.
+
 Tests use real local UDP sockets in both directions and simulated acceptance
 rules: an open filter accepts the alternate-port response; an endpoint-dependent
 filter rejects it while accepting normal replies. Client-supplied address words

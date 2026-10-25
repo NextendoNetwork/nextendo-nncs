@@ -48,6 +48,7 @@ var (
 	// shows different source ports across our two probe ports (10025 vs 10125) it is
 	// symmetric — the case the direct natbridge cannot hole-punch, i.e. the relay trigger.
 	natSeen  = map[string]map[int]int{}
+	natKinds = map[string]string{}
 	typeFile = func() string {
 		if v := os.Getenv("NNCS_TYPE_FILE"); v != "" {
 			return v
@@ -55,6 +56,33 @@ var (
 		return "/data/nat_types.txt"
 	}()
 )
+
+// loadNATState retains existing bridge entries when the responder restarts.
+// Do not erase other active clients on the first new probe after an update.
+func loadNATState() {
+	natMu.Lock()
+	defer natMu.Unlock()
+	if raw, err := os.ReadFile(natFile); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) != 2 || net.ParseIP(fields[0]).To4() == nil {
+				continue
+			}
+			port, err := strconv.Atoi(fields[1])
+			if err == nil && port > 0 && port <= 65535 {
+				natMap[fields[0]] = strconv.Itoa(port)
+			}
+		}
+	}
+	if raw, err := os.ReadFile(typeFile); err == nil {
+		for _, line := range strings.Split(string(raw), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 && net.ParseIP(fields[0]).To4() != nil && (fields[1] == "cone" || fields[1] == "sym") {
+				natKinds[fields[0]] = fields[1]
+			}
+		}
+	}
+}
 
 func recordNAT(ip string, port int) {
 	natMu.Lock()
@@ -96,6 +124,11 @@ func classifyNAT(ip string, dstPort, srcPort int) {
 		if sym {
 			kind = "sym"
 		}
+		if _, known := natKinds[cip]; !known || len(ports) >= 2 {
+			natKinds[cip] = kind
+		}
+	}
+	for cip, kind := range natKinds {
 		b.WriteString(cip + " " + kind + "\n")
 	}
 	_ = os.WriteFile(typeFile, []byte(b.String()), 0644)
@@ -177,6 +210,7 @@ func main() {
 		log.Fatal("[nncs] NNCS_SERVER_IP must be a locally assigned IPv4 address")
 	}
 	serverIP := ipToU32(listenIP)
+	loadNATState()
 
 	// A multihomed host must not select another source IP for the reply. Both
 	// sockets use the configured node address, including alternate-port probes.
