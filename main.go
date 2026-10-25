@@ -3,9 +3,13 @@
 // The MK8 client (Pia NatDetectionJob) resolves nncs1-lp1.n.n.srv.nintendo.net and
 // nncs2-lp1.n.n.srv.nintendo.net (redirected to this VPS by the console's custom DNS) and sends
 // 16-byte UDP probes to ports 10025 and 10125. Each probe is 4x u32 BIG-ENDIAN:
-//   [0]=type/test_id  [4]=ext_port(ignored)  [8]=ext_ip(ignored)  [12]=local_ip
+//
+//	[0]=type/test_id  [4]=ext_port(ignored)  [8]=ext_ip(ignored)  [12]=local_ip
+//
 // We must reply with 16 bytes, 4x u32 BIG-ENDIAN:
-//   [0]=echo type unchanged  [4]=observed UDP source port  [8]=observed source IP  [12]=server IP
+//
+//	[0]=echo type unchanged  [4]=observed UDP source port  [8]=observed source IP  [12]=server IP
+//
 // The Switch only ever sends test ids 101/102/103; the classifier compares the external port it
 // learns across tests. Ports 33334/33335 are reachability sinkholes (bind, never reply).
 //
@@ -168,14 +172,20 @@ func main() {
 	if serverIPStr == "" {
 		serverIPStr = "127.0.0.1"
 	}
-	serverIP := ipToU32(net.ParseIP(serverIPStr))
+	listenIP := net.ParseIP(serverIPStr).To4()
+	if listenIP == nil {
+		log.Fatal("[nncs] NNCS_SERVER_IP must be a locally assigned IPv4 address")
+	}
+	serverIP := ipToU32(listenIP)
 
-	primary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 10025})
+	// A multihomed host must not select another source IP for the reply. Both
+	// sockets use the configured node address, including alternate-port probes.
+	primary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: listenIP, Port: 10025})
 	if err != nil {
 		log.Fatalf("[nncs] bind :10025 failed: %v", err)
 	}
 	defer primary.Close()
-	secondary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 10125})
+	secondary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: listenIP, Port: 10125})
 	if err != nil {
 		log.Fatalf("[nncs] bind :10125 failed: %v", err)
 	}
